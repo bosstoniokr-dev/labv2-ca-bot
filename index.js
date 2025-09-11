@@ -12,7 +12,7 @@ const pcs  = `https://pancakeswap.finance/swap?outputCurrency=${CA}`;
 const dext = `https://www.dextools.io/app/en/bnb/pair-explorer?query=${CA}`;
 const poo  = `https://poocoin.app/tokens/${CA}`;
 
-// Single place to reply with CA (HTML avoids Markdown escaping issues)
+// One place to reply with CA (HTML — no escaping headaches)
 const replyCA = (ctx) =>
   ctx.replyWithHTML(
     [
@@ -28,11 +28,12 @@ const replyCA = (ctx) =>
 // Commands
 bot.start((ctx) => ctx.reply("Hi! Use /ca to get the LABV2 contract address."));
 bot.help((ctx) => ctx.reply("Commands:\n/ca – show LABV2 contract address"));
-bot.command(["ca", "CA"], replyCA); // handle /ca and /CA
+bot.command(["ca", "CA"], replyCA); // /ca and /CA
 
-// Keyword triggers in groups (needs privacy DISABLED)
+// Keyword triggers in groups (privacy must be DISABLED)
 bot.hears(/(^|\s)ca(\?|!|\.|$)/i, replyCA);
 
 bot.catch((err) => console.error("Bot error:", err));
 bot.launch();
 console.log("LABV2 CA bot is running.");
+
