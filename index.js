@@ -1,9 +1,13 @@
-{
-  "name": "labv2-ca-bot",
-  "version": "1.0.0",
-  "type": "module",
-  "main": "index.js",
-  "scripts": { "start": "node index.js" },
-  "engines": { "node": ">=18" },
-  "dependencies": { "telegraf": "^4.16.3" }
-}
+ import { Telegraf } from "telegraf";
+
+const bot = new Telegraf(process.env.BOT_TOKEN);
+
+bot.start((ctx) => ctx.reply("🚀 LABV2 Contract Bot is online! Ask me for the CA."));
+bot.help((ctx) => ctx.reply("Type 'CA' to get the LABV2 contract address."));
+
+bot.hears(/ca/i, (ctx) => {
+  ctx.reply(`🔑 LABV2 Contract Address:\n${process.env.CA}`);
+});
+
+bot.launch();
+
