@@ -5,6 +5,10 @@ const BOT_TOKEN = process.env.BOT_TOKEN;
 const CA = process.env.CA || "0x07f5ceded6b3dba557b3663edc8941fb37b63945";
 if (!BOT_TOKEN) { console.error("Missing BOT_TOKEN"); process.exit(1); }
 
+const WEBSITE_URL  = process.env.WEBSITE_URL  || "#"; // ← add in Railway
+const TWITTER_URL  = process.env.TWITTER_URL  || "#"; // ← add in Railway
+const TELEGRAM_URL = process.env.TELEGRAM_URL || "#"; // ← add in Railway
+
 const bot = new Telegraf(BOT_TOKEN);
 
 // ---- Links
@@ -64,6 +68,7 @@ const replyCA = (ctx) =>
       `<code>${CA}</code>`,
       "",
       `🔎 <a href="${bsc}">BscScan</a> | 🥞 <a href="${pcs}">PancakeSwap</a>`,
+      // If you have a fixed pair link you prefer, replace the pair address below.
       `📊 <a href="https://www.dextools.io/app/en/bnb/pair-explorer/0xe5d1a819a22d16cc34fad3d2d8f7f553bd474407">DexTools</a> | 💩 <a href="${poo}">PooCoin</a>`
     ].join("\n"),
     { disable_web_page_preview: true }
@@ -80,6 +85,17 @@ const replyChart = (ctx) =>
     { disable_web_page_preview: true }
   );
 
+const replyLinks = (ctx) =>
+  ctx.replyWithHTML(
+    [
+      "🔗 <b>LABV2 Official Links</b>",
+      `• 🌐 <a href="${WEBSITE_URL}">Website</a>`,
+      `• 🐦 <a href="${TWITTER_URL}">Twitter/X</a>`,
+      `• 💬 <a href="${TELEGRAM_URL}">Telegram</a>`
+    ].join("\n"),
+    { disable_web_page_preview: true }
+  );
+
 async function replyPrice(ctx) {
   try {
     const p = await getBestPair();
@@ -92,15 +108,15 @@ async function replyPrice(ctx) {
     const priceBnb = p?.priceNative ? (isBase ? Number(p.priceNative) : (1 / Number(p.priceNative))) : null;
 
     // Conversions
-    const perUsd = priceUsd ? (1 / priceUsd) : null;
-    const per10Usd = priceUsd ? (10 / priceUsd) : null;
-    const per100Usd = priceUsd ? (100 / priceUsd) : null;
+    const perUsd   = priceUsd ? (1   / priceUsd) : null;
+    const per10Usd = priceUsd ? (10  / priceUsd) : null;
+    const per100Usd= priceUsd ? (100 / priceUsd) : null;
 
     const ch24 = (p?.priceChange?.h24 ?? null);
     const chTxt = ch24 === null ? "—" : (ch24 >= 0 ? `🟢 +${ch24.toFixed(2)}%` : `🔴 ${ch24.toFixed(2)}%`);
     const vol24 = p?.volume?.h24 ? `$${nf0.format(+p.volume.h24)}` : "—";
     const liqUsd = p?.liquidity?.usd ? `$${nf0.format(+p.liquidity.usd)}` : "—";
-    const mcap = p?.fdv ? `$${nf0.format(+p.fdv)}` : (p?.marketCap ? `$${nf0.format(+p.marketCap)}` : "—");
+    const mcap = p?.fdv ? `$${nf0.format(+p.fdv)}` : (p?.marketCap ? `$${nf0.format(+p.marketCap)}` : "—";
     const updated = p?.updatedAt ? ago(p.updatedAt) : "just now";
 
     const dextLink = `https://www.dextools.io/app/en/bnb/pair-explorer/${p.pairAddress}`;
@@ -130,12 +146,13 @@ async function replyPrice(ctx) {
 }
 
 // ---- Commands
-bot.start((ctx) => ctx.reply("Hi! Use /ca, /chart, or /price for LABV2 info."));
-bot.help((ctx) => ctx.reply("🤖 Commands:\n/ca – Contract + links\n/chart – Charts & trade\n/price – Live price & conversions\n/help – This menu"));
+bot.start((ctx) => ctx.reply("Hi! Use /ca, /chart, /price, or /links for LABV2 info."));
+bot.help((ctx) => ctx.reply("🤖 Commands:\n/ca – Contract + links\n/chart – Charts & trade\n/price – Live price & conversions\n/links – Website, Twitter/X, Telegram\n/help – This menu"));
 
 bot.command(["ca", "CA"], replyCA);
 bot.command(["chart", "charts"], replyChart);
 bot.command(["price", "prices"], replyPrice);
+bot.command(["links", "link"], replyLinks);
 
 // ---- Keyword triggers in groups
 bot.hears(/(^|\s)(ca|contract|address)(\?|!|\.|$)/i, replyCA);
@@ -143,4 +160,4 @@ bot.hears(/(^|\s)(chart|price)(\?|!|\.|$)/i, replyPrice);
 
 bot.catch((err) => console.error("Bot error:", err));
 bot.launch();
-console.log("LABV2 CA/Chart/Price bot is running.");
+console.log("LABV2 CA/Chart/Price/Links bot is running.");
