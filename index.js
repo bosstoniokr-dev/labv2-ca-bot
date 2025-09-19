@@ -1,288 +1,119 @@
- // index.js — LABV2 Bot (CA / Chart / Price / Links) with robust USD price (Dexscreener → PancakeSwap → GeckoTerminal)
+  // index.js — LABV2 Bot with correct USD price from PancakeSwap/GeckoTerminal
 import { Telegraf } from "telegraf";
 import fetch from "node-fetch";
 
-/* ========= ENV VARS ========= */
 const BOT_TOKEN    = process.env.BOT_TOKEN;
-const CA           = (process.env.CA || "").trim();                       // token address
-const PAIR         = (process.env.PAIR || "").trim();                     // pair address (optional but recommended)
+const CA           = (process.env.CA || "").trim();
+const PAIR         = (process.env.PAIR || "").trim();
 const WEBSITE_URL  = (process.env.WEBSITE_URL  || "#").trim();
 const TWITTER_URL  = (process.env.TWITTER_URL  || "#").trim();
 const TELEGRAM_URL = (process.env.TELEGRAM_URL || "#").trim();
 
-if (!BOT_TOKEN) { console.error("❌ Missing BOT_TOKEN"); process.exit(1); }
-if (!CA)        { console.error("❌ Missing CA (token address)"); process.exit(1); }
+if (!BOT_TOKEN || !CA) {
+  console.error("❌ Missing BOT_TOKEN or CA");
+  process.exit(1);
+}
 
 const bot = new Telegraf(BOT_TOKEN);
 
-/* ========= LINKS ========= */
-const bscLink  = `https://bscscan.com/token/${CA}`;
-const pcsLink  = `https://pancakeswap.finance/swap?outputCurrency=${CA}`;
-const pooLink  = `https://poocoin.app/tokens/${CA}`;
-const dexToolsFromPair = (pair) => `https://www.dextools.io/app/en/bnb/pair-explorer/${pair}`;
-
-/* ========= FORMAT HELPERS ========= */
-const nf0  = new Intl.NumberFormat("en-US", { maximumFractionDigits: 0 });
-const nf2  = new Intl.NumberFormat("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const nf0 = new Intl.NumberFormat("en-US", { maximumFractionDigits: 0 });
+const nf2 = new Intl.NumberFormat("en-US", { minimumFractionDigits: 8, maximumFractionDigits: 12 });
 
 function fmtUsd(x) {
-  if (x == null || !isFinite(x) || x <= 0) return "—";
-  if (x >= 1) return `$${nf2.format(+x)}`;
-  const s = (+x).toFixed(14).replace(/0+$/, "").replace(/\.$/, "");
-  return `$${s}`;
-}
-function fmtBnb(x) {
-  if (x == null || !isFinite(x) || x <= 0) return "—";
-  const s = (+x >= 1) ? (+x).toFixed(6) : (+x).toFixed(10);
-  return `${s.replace(/0+$/, "").replace(/\.$/, "")} BNB`;
+  if (!x || x <= 0) return "$—";
+  if (x >= 0.01) return `$${nf2.format(x)}`;
+  return `$${x.toExponential(6)}`;
 }
 function fmtQty(x) {
-  if (x == null || !isFinite(x) || x <= 0) return "—";
-  if (x >= 1) return nf0.format(x);
-  return (+x).toFixed(6).replace(/0+$/, "").replace(/\.$/, "");
+  if (!x || x <= 0) return "—";
+  return nf0.format(x);
 }
 function ago(tsMs) {
   if (!tsMs) return "just now";
   const diff = Date.now() - tsMs;
-  const m = Math.max(1, Math.round(diff / 60000));
+  const m = Math.round(diff / 60000);
   if (m < 60) return `${m}m ago`;
   const h = Math.round(m / 60);
-  if (h < 48) return `${h}h ago`;
-  return `${Math.round(h / 24)}d ago`;
+  return `${h}h ago`;
 }
 
-/* ========= DEXSCREENER FETCHERS ========= */
-async function fetchPairByAddress(pairAddr) {
-  const url = `https://api.dexscreener.com/latest/dex/pairs/bsc/${pairAddr}`;
-  const res = await fetch(url, { timeout: 15000 });
-  if (!res.ok) throw new Error(`Dexscreener pairs HTTP ${res.status}`);
-  const json = await res.json();
-  const p = Array.isArray(json?.pairs) ? json.pairs[0] : null;
-  if (!p) throw new Error("Pair not found on Dexscreener");
-  return p;
-}
-async function fetchBestPairForToken(tokenAddr) {
-  const url = `https://api.dexscreener.com/latest/dex/tokens/bsc/${tokenAddr}`;
-  const res = await fetch(url, { timeout: 15000 });
-  if (!res.ok) throw new Error(`Dexscreener tokens HTTP ${res.status}`);
-  const json = await res.json();
-  const pairs = Array.isArray(json?.pairs) ? json.pairs : [];
-  if (!pairs.length) throw new Error("No pairs found for token");
-  const bscPairs = pairs.filter(p => (p?.chainId || "").toLowerCase() === "bsc");
-  if (!bscPairs.length) throw new Error("No BSC pairs found for token");
-  bscPairs.sort((a, b) => (b?.liquidity?.usd || 0) - (a?.liquidity?.usd || 0));
-  return bscPairs[0];
-}
+/* === Dexscreener === */
 async function getPair() {
-  if (PAIR) return fetchPairByAddress(PAIR);
-  return fetchBestPairForToken(CA);
-}
-
-/* ========= PRICE HELPERS (FALLBACKS) ========= */
-async function getBnbUsdFallback() {
   try {
-    const cg = await fetch(
-      "https://api.coingecko.com/api/v3/simple/price?ids=binancecoin&vs_currencies=usd",
-      { timeout: 15000 }
-    ).then(r => r.json());
-    const v = cg?.binancecoin?.usd;
-    return (v && isFinite(v)) ? Number(v) : 220; // safe default
+    const url = `https://api.dexscreener.com/latest/dex/pairs/bsc/${PAIR || CA}`;
+    const res = await fetch(url);
+    const json = await res.json();
+    return json?.pairs?.[0] || null;
   } catch {
-    return 220;
+    return null;
   }
 }
 
+/* === PancakeSwap Info === */
 async function getPancakeUsd(ca) {
   try {
-    const r = await fetch(
-      `https://api.pancakeswap.info/api/v2/tokens/${ca}`,
-      { timeout: 15000 }
-    );
+    const url = `https://api.pancakeswap.info/api/v2/tokens/${ca}`;
+    const r = await fetch(url);
     if (!r.ok) return null;
     const j = await r.json();
-    const s = j?.data?.price;
-    const val = s ? Number(s) : null;
-    return (val && isFinite(val) && val > 0) ? val : null;
-  } catch { return null; }
-}
-
-async function getGeckoTerminalUsd(ca) {
-  try {
-    const r = await fetch(
-      `https://api.geckoterminal.com/api/v2/networks/bsc/tokens/${ca}`,
-      { timeout: 15000, headers: { accept: "application/json" } }
-    );
-    if (!r.ok) return null;
-    const j = await r.json();
-    const s = j?.data?.attributes?.price_usd;
-    const val = s ? Number(s) : null;
-    return (val && isFinite(val) && val > 0) ? val : null;
-  } catch { return null; }
-}
-
-/**
- * Try to compute USD price in this order:
- *  1) Dexscreener: priceNative × BNB(USD)  (or inverse if token is quote)
- *  2) PancakeSwap Info API (direct USD)
- *  3) GeckoTerminal (direct USD)
- */
-async function resolveUsdPrice(p) {
-  // is our token on base side?
-  const isBase = (p?.baseToken?.address || "").toLowerCase() === CA.toLowerCase();
-
-  // 1) DexScreener computation
-  let usd = null;
-  try {
-    let bnbUsd = 0;
-    if (p?.priceUsd && p?.priceNative && isFinite(+p.priceUsd) && isFinite(+p.priceNative) && +p.priceNative !== 0) {
-      // derive BNB price from the ratio
-      bnbUsd = Number(p.priceUsd) / Number(p.priceNative);
-    }
-    if (!bnbUsd || !isFinite(bnbUsd) || bnbUsd <= 0) {
-      bnbUsd = await getBnbUsdFallback();
-    }
-    if (p?.priceNative && isFinite(+p.priceNative) && +p.priceNative > 0) {
-      const native = Number(p.priceNative);
-      usd = isBase ? (native * bnbUsd) : (bnbUsd / native);
-      if (!(usd && isFinite(usd) && usd > 0)) usd = null;
-    }
-  } catch { usd = null; }
-
-  // 2) PancakeSwap Info
-  if (!usd) {
-    usd = await getPancakeUsd(CA);
-  }
-
-  // 3) GeckoTerminal
-  if (!usd) {
-    usd = await getGeckoTerminalUsd(CA);
-  }
-
-  return usd || null;
-}
-
-/* ========= REPLIES ========= */
-const replyCA = async (ctx) => {
-  const parts = [
-    "🪙 <b>LABV2 Contract Address</b>",
-    `<code>${CA}</code>`,
-    "",
-    `🔎 <a href="${bscLink}">BscScan</a> | 🥞 <a href="${pcsLink}">PancakeSwap</a>`
-  ];
-  try {
-    const p = await getPair();
-    parts.push(`📊 <a href="${dexToolsFromPair(p.pairAddress)}">DexTools</a> | 💩 <a href="${pooLink}">PooCoin</a>`);
+    const val = Number(j?.data?.price);
+    return val > 0 ? val : null;
   } catch {
-    parts.push(`💩 <a href="${pooLink}">PooCoin</a>`);
+    return null;
   }
-  return ctx.replyWithHTML(parts.join("\n"), { disable_web_page_preview: true });
-};
+}
 
-const replyChart = async (ctx) => {
-  const lines = ["📊 <b>LABV2 Charts & Trade</b>"];
+/* === GeckoTerminal === */
+async function getGeckoUsd(ca) {
   try {
-    const p = await getPair();
-    lines.push(`• <a href="${dexToolsFromPair(p.pairAddress)}">DexTools</a>`);
-  } catch { /* ignore */ }
-  lines.push(`• <a href="${pooLink}">PooCoin</a>`);
-  lines.push(`• <a href="${pcsLink}">PancakeSwap</a>`);
-  return ctx.replyWithHTML(lines.join("\n"), { disable_web_page_preview: true });
-};
+    const url = `https://api.geckoterminal.com/api/v2/networks/bsc/tokens/${ca}`;
+    const r = await fetch(url, { headers: { accept: "application/json" } });
+    if (!r.ok) return null;
+    const j = await r.json();
+    const val = Number(j?.data?.attributes?.price_usd);
+    return val > 0 ? val : null;
+  } catch {
+    return null;
+  }
+}
 
-const replyLinks = (ctx) =>
-  ctx.replyWithHTML(
-    [
-      "🔗 <b>LABV2 Official Links</b>",
-      `• 🌐 <a href="${WEBSITE_URL}">Website</a>`,
-      `• 🐦 <a href="${TWITTER_URL}">Twitter/X</a>`,
-      `• 💬 <a href="${TELEGRAM_URL}">Telegram</a>`
-    ].join("\n"),
-    { disable_web_page_preview: true }
-  );
-
+/* === Price Handler === */
 async function replyPrice(ctx) {
   try {
     const p = await getPair();
+    let usd = await getPancakeUsd(CA);
+    if (!usd) usd = await getGeckoUsd(CA);
 
-    // USD price (with fallbacks)
-    const usd = await resolveUsdPrice(p);
-
-    // native price (BNB) — still show if available
-    const isBase = (p?.baseToken?.address || "").toLowerCase() === CA.toLowerCase();
-    const nativeOk = (p?.priceNative && isFinite(+p.priceNative) && +p.priceNative > 0);
-    const priceBnb = nativeOk
-      ? (isBase ? +p.priceNative : (1 / +p.priceNative))
-      : null;
-
-    // BNB USD for conversions to priceBNB if needed
-    let bnbUsd = await getBnbUsdFallback();
-
-    // Conversions
     const per1   = usd ? (1   / usd) : null;
     const per10  = usd ? (10  / usd) : null;
     const per100 = usd ? (100 / usd) : null;
 
-    // 24h stats
-    const ch24 = (p?.priceChange?.h24 ?? null);
-    const chTxt = (ch24 === null) ? "—" : (ch24 >= 0 ? `🟢 +${(+ch24).toFixed(2)}%` : `🔴 ${(+ch24).toFixed(2)}%`);
-    const liqUsd = (p?.liquidity?.usd != null) ? `$${nf0.format(+p.liquidity.usd)}` : "—";
-    const vol24  = (p?.volume?.h24   != null) ? `$${nf0.format(+p.volume.h24)}`     : "—";
-    const mcap   = (p?.fdv != null) ? `$${nf0.format(+p.fdv)}`
-                 : ((p?.marketCap != null) ? `$${nf0.format(+p.marketCap)}` : "—");
+    const ch24  = p?.priceChange?.h24 ?? "—";
+    const vol24 = p?.volume?.h24 ? `$${nf0.format(p.volume.h24)}` : "—";
+    const liq   = p?.liquidity?.usd ? `$${nf0.format(p.liquidity.usd)}` : "—";
+    const mcap  = p?.fdv ? `$${nf0.format(p.fdv)}` : "—";
     const updated = p?.updatedAt ? ago(p.updatedAt) : "just now";
-    const dexLink = dexToolsFromPair(p.pairAddress);
 
-    // If we don’t have native price but we do have USD + bnbUsd, compute BNB price for display
-    const showBnb = priceBnb || (usd && bnbUsd ? (usd / bnbUsd) : null);
-
-    const lines = [
+    const msg = [
       `💹 <b>LABV2 Price</b> — ${fmtUsd(usd)}`,
-      `• Price: <b>${fmtUsd(usd)}</b> (${fmtBnb(showBnb)})`,
-      `• $1 ≈ <b>${fmtQty(per1)}</b> LABV2`,
-      `• $10 ≈ <b>${fmtQty(per10)}</b> LABV2`,
-      `• $100 ≈ <b>${fmtQty(per100)}</b> LABV2`,
-      `• 24h Change: <b>${chTxt}</b>`,
-      `• 24h Volume: <b>${vol24}</b>`,
-      `• Liquidity: <b>${liqUsd}</b>`,
-      `• FDV/MC: <b>${mcap}</b>`,
-      `• Updated: <i>${updated}</i>`,
-      "",
-      `📊 <a href="${dexLink}">DexTools</a> | 💩 <a href="${pooLink}">PooCoin</a> | 🥞 <a href="${pcsLink}">Trade</a>`
+      `• $1 ≈ ${fmtQty(per1)} LABV2`,
+      `• $10 ≈ ${fmtQty(per10)} LABV2`,
+      `• $100 ≈ ${fmtQty(per100)} LABV2`,
+      `• 24h Change: ${ch24}%`,
+      `• 24h Volume: ${vol24}`,
+      `• Liquidity: ${liq}`,
+      `• FDV/MC: ${mcap}`,
+      `• Updated: ${updated}`
     ];
 
-    await ctx.replyWithHTML(lines.join("\n"), { disable_web_page_preview: true });
-  } catch (err) {
-    console.error("Price fetch error:", err);
-    await ctx.reply("❌ Unable to fetch price right now. Please try again shortly.");
+    await ctx.replyWithHTML(msg.join("\n"), { disable_web_page_preview: true });
+  } catch (e) {
+    console.error(e);
+    ctx.reply("❌ Could not fetch price right now.");
   }
 }
 
-/* ========= COMMANDS ========= */
-bot.start((ctx) =>
-  ctx.reply("Hi! Use /ca, /chart, /price, or /links for LABV2 info.\n/help to see all commands.")
-);
-
-bot.help((ctx) =>
-  ctx.reply(
-    "🤖 Commands:\n" +
-    "/ca – Contract + links\n" +
-    "/chart – Charts & trade\n" +
-    "/price – Live price + $1/$10/$100\n" +
-    "/links – Website, Twitter/X, Telegram\n" +
-    "/help – This menu"
-  )
-);
-
-bot.command(["ca", "CA"], replyCA);
-bot.command(["chart", "charts"], replyChart);
-bot.command(["price", "prices"], replyPrice);
-bot.command(["links", "link"], replyLinks);
-
-/* ========= KEYWORD TRIGGERS (for groups) ========= */
-bot.hears(/(^|\s)(ca|contract|address)(\?|!|\.|$)/i, replyCA);
-bot.hears(/(^|\s)(price|chart)(\?|!|\.|$)/i, replyPrice);
-
-/* ========= LAUNCH ========= */
-bot.catch((err) => console.error("Bot error:", err));
+/* === Commands === */
+bot.command("price", replyPrice);
+bot.start((ctx) => ctx.reply("Hi! Use /price, /ca, /chart, /links"));
 bot.launch();
-console.log("✅ LABV2 bot is running (CA/Chart/Price/Links) with robust USD price.");
