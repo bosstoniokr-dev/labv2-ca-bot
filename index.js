@@ -1,10 +1,8 @@
- /* =====================  /price handler (fixed & robust)  ===================== */
-// Uses DexScreener token endpoint (correct path), then falls back to pair endpoint,
-// PancakeSwap Info, and GeckoTerminal. Includes safe debug output when DEBUG=1.
+ /* =====================  /price handler (no node-fetch)  ===================== */
+// Uses built-in fetch from Node 18+
+// Make sure env has: BOT_TOKEN, CA, (optional) PAIR, (optional) DEBUG=1
 
-import fetch from "node-fetch";
-
-// --- env & small utils (uses same env you already have) ---
+// --- env & small utils ---
 const CA           = (process.env.CA || "").trim();
 const PAIR_ENV     = (process.env.PAIR || "").trim();
 const DEBUG        = (process.env.DEBUG || "").trim() === "1";
@@ -32,10 +30,11 @@ function ago(ms) {
 }
 
 // --- safe fetch helper ---
-const UA = "LABV2-TelegramBot/1.0 (+https://t.me/) NodeFetch";
+const UA = "LABV2-TelegramBot/1.0 (+https://t.me/)";
 async function safeFetchJson(url, opts = {}) {
   const res = await fetch(url, {
-    timeout: 15000,
+    // Node 18 global fetch supports AbortSignal timeout via controller pattern.
+    // We'll just rely on sane endpoints; if you want hard timeout, add AbortController.
     headers: { "user-agent": UA, accept: "application/json", ...(opts.headers || {}) },
     ...opts,
   });
@@ -50,15 +49,13 @@ async function safeFetchJson(url, opts = {}) {
 /* ----------------  DexScreener (correct endpoints)  ---------------- */
 // 1) Correct token endpoint: NO /bsc/, pass the contract directly
 async function dsBestTokenPair(contract) {
-  // ✅ FIXED: correct path (no `/bsc/`)
   const t = await safeFetchJson(`https://api.dexscreener.com/latest/dex/tokens/${contract}`);
   const arr = Array.isArray(t?.pairs) ? t.pairs : [];
   if (arr.length) {
     arr.sort((a,b) => (b?.liquidity?.usd || 0) - (a?.liquidity?.usd || 0));
     return { pair: arr[0], source: "dexscreener-token" };
   }
-
-  // 2) Search endpoint (filter to BSC)
+  // 2) Search endpoint (filter BSC)
   const s = await safeFetchJson(`https://api.dexscreener.com/latest/dex/search?q=${contract}`);
   const sArr = Array.isArray(s?.pairs) ? s.pairs.filter(p => (p?.chainId||"").toLowerCase()==="bsc") : [];
   if (sArr.length) {
@@ -138,7 +135,7 @@ async function resolvePriceAndStats_FIXED() {
   return { pair: p, dsSource, priceUsd, notes };
 }
 
-/* ----------------  /price reply (drop-in)  ---------------- */
+/* ----------------  /price reply  ---------------- */
 export async function replyPrice(ctx) {
   try {
     const { pair: p, priceUsd: usd, dsSource, notes } = await resolvePriceAndStats_FIXED();
@@ -161,7 +158,6 @@ export async function replyPrice(ctx) {
                   : (p?.marketCap != null ? `$${nf0.format(+p.marketCap)}` : "—");
     const updated = p?.updatedAt ? ago(p.updatedAt) : "just now";
 
-    // build quick links (use your existing link builders if you have them)
     const pooLink = `https://poocoin.app/tokens/${CA}`;
     const pcsLink = `https://pancakeswap.finance/swap?outputCurrency=${CA}`;
     const pairAddr = p?.pairAddress || PAIR_ENV || "";
