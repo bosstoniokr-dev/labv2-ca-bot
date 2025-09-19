@@ -1,22 +1,22 @@
- // index.js  —  LABV2 Contract Bot (single-file, no self-imports)
+ // index.js — LABV2 Contract Bot (single-file, ESM, Node 18+)
 
 import { Telegraf } from "telegraf";
 
-/* ========== ENV ========== */
+/* ========= ENV ========= */
 const BOT_TOKEN = process.env.BOT_TOKEN?.trim();
-const CA        = process.env.CA?.trim();
-const PAIR_ENV  = process.env.PAIR?.trim() || "";
-const DEBUG     = (process.env.DEBUG || "") === "1";
+const CA        = process.env.CA?.trim();             // LABV2 contract
+const PAIR_ENV  = process.env.PAIR?.trim() || "";     // Optional pair (LABV2/WBNB)
+const DEBUG     = (process.env.DEBUG || "") === "1";  // set 1 while testing
 
 if (!BOT_TOKEN || !CA) {
   console.error("Missing BOT_TOKEN or CA env.");
   process.exit(1);
 }
 
-/* ========== BOT ========== */
+/* ========= BOT ========= */
 const bot = new Telegraf(BOT_TOKEN);
 
-/* ========== UTILS ========== */
+/* ========= UTILS ========= */
 const nf0 = new Intl.NumberFormat("en-US", { maximumFractionDigits: 0 });
 
 function esc(s = "") {
@@ -53,8 +53,8 @@ async function safeFetchJson(url, opts = {}) {
   return res.json();
 }
 
-/* ========== PRICE RESOLUTION ========== */
-// DexScreener: token endpoint (correct, no /bsc/)
+/* ========= DATA SOURCES ========= */
+// DexScreener token/search (correct endpoint: no /bsc/)
 async function dsBestTokenPair(contract) {
   const t = await safeFetchJson(`https://api.dexscreener.com/latest/dex/tokens/${contract}`);
   const arr = Array.isArray(t?.pairs) ? t.pairs : [];
@@ -62,7 +62,7 @@ async function dsBestTokenPair(contract) {
     arr.sort((a,b) => (b?.liquidity?.usd || 0) - (a?.liquidity?.usd || 0));
     return { pair: arr[0], source: "dexscreener-token" };
   }
-  // search (filter BSC)
+  // fallback search (filter BSC)
   const s = await safeFetchJson(`https://api.dexscreener.com/latest/dex/search?q=${contract}`);
   const sArr = Array.isArray(s?.pairs) ? s.pairs.filter(p => (p?.chainId||"").toLowerCase()==="bsc") : [];
   if (sArr.length) {
@@ -72,7 +72,6 @@ async function dsBestTokenPair(contract) {
   throw new Error("DexScreener: no token pairs found");
 }
 
-// DexScreener: explicit pair (if provided)
 async function dsPair(pairAddress) {
   const j = await safeFetchJson(`https://api.dexscreener.com/latest/dex/pairs/bsc/${pairAddress}`);
   const p = j?.pair || (Array.isArray(j?.pairs) ? j.pairs[0] : null);
@@ -80,20 +79,19 @@ async function dsPair(pairAddress) {
   return { pair: p, source: "dexscreener-pair" };
 }
 
-// PancakeSwap info (price-only fallback)
 async function psPriceUsd(contract) {
   const j = await safeFetchJson(`https://api.pancakeswap.info/api/v2/tokens/${contract}`);
   const v = Number(j?.data?.price);
   return (v > 0 && isFinite(v)) ? v : null;
 }
 
-// GeckoTerminal (price-only fallback)
 async function gtPriceUsd(contract) {
   const j = await safeFetchJson(`https://api.geckoterminal.com/api/v2/networks/bsc/tokens/${contract}`);
   const v = Number(j?.data?.attributes?.price_usd);
   return (v > 0 && isFinite(v)) ? v : null;
 }
 
+/* ========= PRICE RESOLUTION (with manual USD calc) ========= */
 async function resolvePriceAndStats() {
   const notes = [];
   let p = null, dsSource = "", priceUsd = null;
@@ -102,23 +100,50 @@ async function resolvePriceAndStats() {
   try {
     const { pair, source } = await dsBestTokenPair(CA);
     p = pair; dsSource = source;
-    if (Number(p?.priceUsd) > 0) priceUsd = Number(p.priceUsd);
-    notes.push(`${source}: ok`);
-  } catch (e) { notes.push(`ds-token/search: ${e.message}`); }
 
-  // B) DexScreener pair (if PAIR set)
+    // try direct USD
+    if (Number(p?.priceUsd) > 0) {
+      priceUsd = Number(p.priceUsd);
+      notes.push(`${source}: priceUsd ok`);
+    } else if (p?.priceNative && p?.quoteToken?.priceUsd) {
+      // compute: LABV2 per BNB × BNB/USD
+      const native = Number(p.priceNative);
+      const bnbUsd = Number(p.quoteToken.priceUsd);
+      if (native > 0 && bnbUsd > 0) {
+        priceUsd = native * bnbUsd;
+        notes.push(`${source}: calc native×bnb ok`);
+      }
+    }
+  } catch (e) {
+    notes.push(`ds-token/search: ${e.message}`);
+  }
+
+  // B) DexScreener pair fallback (if PAIR set)
   if ((!p || !priceUsd) && PAIR_ENV) {
     try {
       const { pair, source } = await dsPair(PAIR_ENV);
       if (!p || (pair?.liquidity?.usd || 0) > (p?.liquidity?.usd || 0)) {
         p = pair; dsSource = source;
       }
-      if (!priceUsd && Number(pair?.priceUsd) > 0) priceUsd = Number(pair.priceUsd);
-      notes.push(`${source}: ok`);
-    } catch (e) { notes.push(`ds-pair: ${e.message}`); }
+      if (!priceUsd) {
+        if (Number(pair?.priceUsd) > 0) {
+          priceUsd = Number(pair.priceUsd);
+          notes.push(`${source}: priceUsd ok`);
+        } else if (pair?.priceNative && pair?.quoteToken?.priceUsd) {
+          const native = Number(pair.priceNative);
+          const bnbUsd = Number(pair.quoteToken.priceUsd);
+          if (native > 0 && bnbUsd > 0) {
+            priceUsd = native * bnbUsd;
+            notes.push(`${source}: calc native×bnb ok`);
+          }
+        }
+      }
+    } catch (e) {
+      notes.push(`ds-pair: ${e.message}`);
+    }
   }
 
-  // C) PancakeSwap
+  // C) PancakeSwap fallback
   if (!priceUsd) {
     try {
       const v = await psPriceUsd(CA);
@@ -127,7 +152,7 @@ async function resolvePriceAndStats() {
     } catch (e) { notes.push(`pancakeswap: ${e.message}`); }
   }
 
-  // D) GeckoTerminal
+  // D) GeckoTerminal fallback
   if (!priceUsd) {
     try {
       const v = await gtPriceUsd(CA);
@@ -139,10 +164,8 @@ async function resolvePriceAndStats() {
   return { pair: p, dsSource, priceUsd, notes };
 }
 
-/* ========== COMMANDS ========== */
-bot.start((ctx) =>
-  ctx.reply("Hi! Use /ca, /price, /links")
-);
+/* ========= COMMANDS ========= */
+bot.start((ctx) => ctx.reply("Hi! Use /ca, /price, /links"));
 
 bot.command(["ca"], async (ctx) => {
   const bsc = `https://bscscan.com/token/${CA}`;
@@ -151,6 +174,7 @@ bot.command(["ca"], async (ctx) => {
   const dex = PAIR_ENV
     ? `https://www.dextools.io/app/en/bnb/pair-explorer/${PAIR_ENV}`
     : `https://www.dextools.io/app/en/bnb/search?q=${CA}`;
+
   const msg = [
     "<b>LABV2 Contract Address</b>",
     `<code>${esc(CA)}</code>`,
@@ -158,25 +182,28 @@ bot.command(["ca"], async (ctx) => {
     `📄 <a href="${bsc}">BscScan</a> | 🥞 <a href="${pcs}">PancakeSwap</a>`,
     `💩 <a href="${poo}">PooCoin</a> | 📊 <a href="${dex}">DexTools</a>`,
   ].join("\n");
+
   await ctx.replyWithHTML(msg, { disable_web_page_preview: true });
 });
 
 bot.command(["links"], async (ctx) => {
-  // Replace with your real socials
+  // TODO: replace with your real links
   const site = "https://your-website.example/";
   const x    = "https://twitter.com/your_x_handle";
   const tg   = "https://t.me/your_group";
+
   const msg = [
     "<b>LABV2 Official Links</b>",
     `🌐 <a href="${site}">Website</a>`,
     `𝕏 <a href="${x}">Twitter/X</a>`,
     `🗣️ <a href="${tg}">Telegram</a>`,
   ].join("\n");
+
   await ctx.replyWithHTML(msg, { disable_web_page_preview: true });
 });
 
 bot.command(["price","prices"], async (ctx) => {
-  console.log("Received /price from", ctx.chat?.id); // visibility in logs
+  console.log("Received /price from", ctx.chat?.id);
   try {
     const { pair: p, priceUsd: usd, dsSource, notes } = await resolvePriceAndStats();
 
@@ -227,10 +254,8 @@ bot.command(["price","prices"], async (ctx) => {
   }
 });
 
-/* ========== START ========== */
+/* ========= START ========= */
 bot.launch();
 console.log("LABV2 bot is running…");
-
-/* graceful stop */
 process.once("SIGINT", () => bot.stop("SIGINT"));
 process.once("SIGTERM", () => bot.stop("SIGTERM"));
