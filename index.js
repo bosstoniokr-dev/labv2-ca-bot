@@ -1,4 +1,4 @@
- // index.js — LABV2 Bot (CA / Chart / Price / Links) with robust USD price
+ // index.js — LABV2 Bot (CA / Chart / Price / Links) with robust USD price (Dexscreener → PancakeSwap → GeckoTerminal)
 import { Telegraf } from "telegraf";
 import fetch from "node-fetch";
 
@@ -26,18 +26,18 @@ const nf0  = new Intl.NumberFormat("en-US", { maximumFractionDigits: 0 });
 const nf2  = new Intl.NumberFormat("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
 function fmtUsd(x) {
-  if (x == null || !isFinite(x)) return "—";
+  if (x == null || !isFinite(x) || x <= 0) return "—";
   if (x >= 1) return `$${nf2.format(+x)}`;
-  const s = (+x).toFixed(12).replace(/0+$/, "").replace(/\.$/, "");
+  const s = (+x).toFixed(14).replace(/0+$/, "").replace(/\.$/, "");
   return `$${s}`;
 }
 function fmtBnb(x) {
-  if (x == null || !isFinite(x)) return "—";
+  if (x == null || !isFinite(x) || x <= 0) return "—";
   const s = (+x >= 1) ? (+x).toFixed(6) : (+x).toFixed(10);
   return `${s.replace(/0+$/, "").replace(/\.$/, "")} BNB`;
 }
 function fmtQty(x) {
-  if (x == null || !isFinite(x)) return "—";
+  if (x == null || !isFinite(x) || x <= 0) return "—";
   if (x >= 1) return nf0.format(x);
   return (+x).toFixed(6).replace(/0+$/, "").replace(/\.$/, "");
 }
@@ -78,15 +78,87 @@ async function getPair() {
   return fetchBestPairForToken(CA);
 }
 
-/* ========= HELPERS FOR PRICE ========= */
+/* ========= PRICE HELPERS (FALLBACKS) ========= */
 async function getBnbUsdFallback() {
   try {
-    const cg = await fetch("https://api.coingecko.com/api/v3/simple/price?ids=binancecoin&vs_currencies=usd", { timeout: 15000 }).then(r => r.json());
+    const cg = await fetch(
+      "https://api.coingecko.com/api/v3/simple/price?ids=binancecoin&vs_currencies=usd",
+      { timeout: 15000 }
+    ).then(r => r.json());
     const v = cg?.binancecoin?.usd;
-    return (v && isFinite(v)) ? Number(v) : 220;   // safe default
+    return (v && isFinite(v)) ? Number(v) : 220; // safe default
   } catch {
-    return 220; // default if coingecko fails
+    return 220;
   }
+}
+
+async function getPancakeUsd(ca) {
+  try {
+    const r = await fetch(
+      `https://api.pancakeswap.info/api/v2/tokens/${ca}`,
+      { timeout: 15000 }
+    );
+    if (!r.ok) return null;
+    const j = await r.json();
+    const s = j?.data?.price;
+    const val = s ? Number(s) : null;
+    return (val && isFinite(val) && val > 0) ? val : null;
+  } catch { return null; }
+}
+
+async function getGeckoTerminalUsd(ca) {
+  try {
+    const r = await fetch(
+      `https://api.geckoterminal.com/api/v2/networks/bsc/tokens/${ca}`,
+      { timeout: 15000, headers: { accept: "application/json" } }
+    );
+    if (!r.ok) return null;
+    const j = await r.json();
+    const s = j?.data?.attributes?.price_usd;
+    const val = s ? Number(s) : null;
+    return (val && isFinite(val) && val > 0) ? val : null;
+  } catch { return null; }
+}
+
+/**
+ * Try to compute USD price in this order:
+ *  1) Dexscreener: priceNative × BNB(USD)  (or inverse if token is quote)
+ *  2) PancakeSwap Info API (direct USD)
+ *  3) GeckoTerminal (direct USD)
+ */
+async function resolveUsdPrice(p) {
+  // is our token on base side?
+  const isBase = (p?.baseToken?.address || "").toLowerCase() === CA.toLowerCase();
+
+  // 1) DexScreener computation
+  let usd = null;
+  try {
+    let bnbUsd = 0;
+    if (p?.priceUsd && p?.priceNative && isFinite(+p.priceUsd) && isFinite(+p.priceNative) && +p.priceNative !== 0) {
+      // derive BNB price from the ratio
+      bnbUsd = Number(p.priceUsd) / Number(p.priceNative);
+    }
+    if (!bnbUsd || !isFinite(bnbUsd) || bnbUsd <= 0) {
+      bnbUsd = await getBnbUsdFallback();
+    }
+    if (p?.priceNative && isFinite(+p.priceNative) && +p.priceNative > 0) {
+      const native = Number(p.priceNative);
+      usd = isBase ? (native * bnbUsd) : (bnbUsd / native);
+      if (!(usd && isFinite(usd) && usd > 0)) usd = null;
+    }
+  } catch { usd = null; }
+
+  // 2) PancakeSwap Info
+  if (!usd) {
+    usd = await getPancakeUsd(CA);
+  }
+
+  // 3) GeckoTerminal
+  if (!usd) {
+    usd = await getGeckoTerminalUsd(CA);
+  }
+
+  return usd || null;
 }
 
 /* ========= REPLIES ========= */
@@ -132,59 +204,40 @@ async function replyPrice(ctx) {
   try {
     const p = await getPair();
 
-    // Determine if baseToken is our token
+    // USD price (with fallbacks)
+    const usd = await resolveUsdPrice(p);
+
+    // native price (BNB) — still show if available
     const isBase = (p?.baseToken?.address || "").toLowerCase() === CA.toLowerCase();
-
-    // --- Step 1: Figure out BNB price in USD ---
-    // Strategy:
-    //  - If Dexscreener gives priceUsd + priceNative, derive bnbUsd = priceUsd/priceNative
-    //  - Else fallback to CoinGecko
-    let bnbUsd = 0;
-    if (p?.priceUsd && p?.priceNative && isFinite(+p.priceUsd) && isFinite(+p.priceNative) && +p.priceNative !== 0) {
-      bnbUsd = Number(p.priceUsd) / Number(p.priceNative);
-    }
-    if (!bnbUsd || !isFinite(bnbUsd)) {
-      bnbUsd = await getBnbUsdFallback();
-    }
-
-    // --- Step 2: LABV2 price in USD using native price * BNB USD ---
-    // If baseToken is LABV2, priceNative already means LABV2 per 1 BNB (or inverse depending on DS).
-    // For robustness we mirror previous logic: use priceNative consistently and flip when token is quote.
-    let priceUsd = null;
-    if (p?.priceNative && isFinite(+p.priceNative)) {
-      const nativePrice = Number(p.priceNative);
-      priceUsd = isBase ? (nativePrice * bnbUsd) : (bnbUsd / nativePrice);
-    }
-
-    // --- Step 3: Price in BNB (for display) ---
-    const priceBnb = (p?.priceNative && isFinite(+p.priceNative))
+    const nativeOk = (p?.priceNative && isFinite(+p.priceNative) && +p.priceNative > 0);
+    const priceBnb = nativeOk
       ? (isBase ? +p.priceNative : (1 / +p.priceNative))
       : null;
 
-    // --- Step 4: Conversions ---
-    const per1   = priceUsd ? (1   / priceUsd) : null;
-    const per10  = priceUsd ? (10  / priceUsd) : null;
-    const per100 = priceUsd ? (100 / priceUsd) : null;
+    // BNB USD for conversions to priceBNB if needed
+    let bnbUsd = await getBnbUsdFallback();
 
-    // --- Stats ---
+    // Conversions
+    const per1   = usd ? (1   / usd) : null;
+    const per10  = usd ? (10  / usd) : null;
+    const per100 = usd ? (100 / usd) : null;
+
+    // 24h stats
     const ch24 = (p?.priceChange?.h24 ?? null);
     const chTxt = (ch24 === null) ? "—" : (ch24 >= 0 ? `🟢 +${(+ch24).toFixed(2)}%` : `🔴 ${(+ch24).toFixed(2)}%`);
-
     const liqUsd = (p?.liquidity?.usd != null) ? `$${nf0.format(+p.liquidity.usd)}` : "—";
     const vol24  = (p?.volume?.h24   != null) ? `$${nf0.format(+p.volume.h24)}`     : "—";
-
-    const mcap = (p?.fdv != null)
-      ? `$${nf0.format(+p.fdv)}`
-      : ((p?.marketCap != null)
-          ? `$${nf0.format(+p.marketCap)}`
-          : "—");
-
+    const mcap   = (p?.fdv != null) ? `$${nf0.format(+p.fdv)}`
+                 : ((p?.marketCap != null) ? `$${nf0.format(+p.marketCap)}` : "—");
     const updated = p?.updatedAt ? ago(p.updatedAt) : "just now";
     const dexLink = dexToolsFromPair(p.pairAddress);
 
+    // If we don’t have native price but we do have USD + bnbUsd, compute BNB price for display
+    const showBnb = priceBnb || (usd && bnbUsd ? (usd / bnbUsd) : null);
+
     const lines = [
-      `💹 <b>LABV2 Price</b> — ${fmtUsd(priceUsd)}`,
-      `• Price: <b>${fmtUsd(priceUsd)}</b> (${fmtBnb(priceBnb)})`,
+      `💹 <b>LABV2 Price</b> — ${fmtUsd(usd)}`,
+      `• Price: <b>${fmtUsd(usd)}</b> (${fmtBnb(showBnb)})`,
       `• $1 ≈ <b>${fmtQty(per1)}</b> LABV2`,
       `• $10 ≈ <b>${fmtQty(per10)}</b> LABV2`,
       `• $100 ≈ <b>${fmtQty(per100)}</b> LABV2`,
@@ -206,9 +259,7 @@ async function replyPrice(ctx) {
 
 /* ========= COMMANDS ========= */
 bot.start((ctx) =>
-  ctx.reply(
-    "Hi! Use /ca, /chart, /price, or /links for LABV2 info.\n/help to see all commands."
-  )
+  ctx.reply("Hi! Use /ca, /chart, /price, or /links for LABV2 info.\n/help to see all commands.")
 );
 
 bot.help((ctx) =>
@@ -234,4 +285,4 @@ bot.hears(/(^|\s)(price|chart)(\?|!|\.|$)/i, replyPrice);
 /* ========= LAUNCH ========= */
 bot.catch((err) => console.error("Bot error:", err));
 bot.launch();
-console.log("✅ LABV2 bot is running (CA/Chart/Price/Links) with USD price via BNB.");
+console.log("✅ LABV2 bot is running (CA/Chart/Price/Links) with robust USD price.");
