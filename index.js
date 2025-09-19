@@ -1,12 +1,22 @@
- /* =====================  /price handler (no node-fetch)  ===================== */
-// Uses built-in fetch from Node 18+
-// Make sure env has: BOT_TOKEN, CA, (optional) PAIR, (optional) DEBUG=1
+ // index.js  —  LABV2 Contract Bot (single-file, no self-imports)
 
-// --- env & small utils ---
-const CA           = (process.env.CA || "").trim();
-const PAIR_ENV     = (process.env.PAIR || "").trim();
-const DEBUG        = (process.env.DEBUG || "").trim() === "1";
+import { Telegraf } from "telegraf";
 
+/* ========== ENV ========== */
+const BOT_TOKEN = process.env.BOT_TOKEN?.trim();
+const CA        = process.env.CA?.trim();
+const PAIR_ENV  = process.env.PAIR?.trim() || "";
+const DEBUG     = (process.env.DEBUG || "") === "1";
+
+if (!BOT_TOKEN || !CA) {
+  console.error("Missing BOT_TOKEN or CA env.");
+  process.exit(1);
+}
+
+/* ========== BOT ========== */
+const bot = new Telegraf(BOT_TOKEN);
+
+/* ========== UTILS ========== */
 const nf0 = new Intl.NumberFormat("en-US", { maximumFractionDigits: 0 });
 
 function esc(s = "") {
@@ -29,12 +39,9 @@ function ago(ms) {
   return `${h}h ago`;
 }
 
-// --- safe fetch helper ---
 const UA = "LABV2-TelegramBot/1.0 (+https://t.me/)";
 async function safeFetchJson(url, opts = {}) {
   const res = await fetch(url, {
-    // Node 18 global fetch supports AbortSignal timeout via controller pattern.
-    // We'll just rely on sane endpoints; if you want hard timeout, add AbortController.
     headers: { "user-agent": UA, accept: "application/json", ...(opts.headers || {}) },
     ...opts,
   });
@@ -46,8 +53,8 @@ async function safeFetchJson(url, opts = {}) {
   return res.json();
 }
 
-/* ----------------  DexScreener (correct endpoints)  ---------------- */
-// 1) Correct token endpoint: NO /bsc/, pass the contract directly
+/* ========== PRICE RESOLUTION ========== */
+// DexScreener: token endpoint (correct, no /bsc/)
 async function dsBestTokenPair(contract) {
   const t = await safeFetchJson(`https://api.dexscreener.com/latest/dex/tokens/${contract}`);
   const arr = Array.isArray(t?.pairs) ? t.pairs : [];
@@ -55,7 +62,7 @@ async function dsBestTokenPair(contract) {
     arr.sort((a,b) => (b?.liquidity?.usd || 0) - (a?.liquidity?.usd || 0));
     return { pair: arr[0], source: "dexscreener-token" };
   }
-  // 2) Search endpoint (filter BSC)
+  // search (filter BSC)
   const s = await safeFetchJson(`https://api.dexscreener.com/latest/dex/search?q=${contract}`);
   const sArr = Array.isArray(s?.pairs) ? s.pairs.filter(p => (p?.chainId||"").toLowerCase()==="bsc") : [];
   if (sArr.length) {
@@ -65,7 +72,7 @@ async function dsBestTokenPair(contract) {
   throw new Error("DexScreener: no token pairs found");
 }
 
-// 3) Explicit pair endpoint (if you provide PAIR)
+// DexScreener: explicit pair (if provided)
 async function dsPair(pairAddress) {
   const j = await safeFetchJson(`https://api.dexscreener.com/latest/dex/pairs/bsc/${pairAddress}`);
   const p = j?.pair || (Array.isArray(j?.pairs) ? j.pairs[0] : null);
@@ -73,34 +80,33 @@ async function dsPair(pairAddress) {
   return { pair: p, source: "dexscreener-pair" };
 }
 
-/* ----------------  Extra price fallbacks  ---------------- */
+// PancakeSwap info (price-only fallback)
 async function psPriceUsd(contract) {
   const j = await safeFetchJson(`https://api.pancakeswap.info/api/v2/tokens/${contract}`);
   const v = Number(j?.data?.price);
   return (v > 0 && isFinite(v)) ? v : null;
 }
+
+// GeckoTerminal (price-only fallback)
 async function gtPriceUsd(contract) {
   const j = await safeFetchJson(`https://api.geckoterminal.com/api/v2/networks/bsc/tokens/${contract}`);
   const v = Number(j?.data?.attributes?.price_usd);
   return (v > 0 && isFinite(v)) ? v : null;
 }
 
-/* ----------------  Resolve price & stats  ---------------- */
-async function resolvePriceAndStats_FIXED() {
+async function resolvePriceAndStats() {
   const notes = [];
   let p = null, dsSource = "", priceUsd = null;
 
-  // A) DexScreener (token/search)
+  // A) DexScreener token/search
   try {
     const { pair, source } = await dsBestTokenPair(CA);
     p = pair; dsSource = source;
     if (Number(p?.priceUsd) > 0) priceUsd = Number(p.priceUsd);
     notes.push(`${source}: ok`);
-  } catch (e) {
-    notes.push(`ds-token/search: ${e.message}`);
-  }
+  } catch (e) { notes.push(`ds-token/search: ${e.message}`); }
 
-  // B) DexScreener pair (if PAIR is set)
+  // B) DexScreener pair (if PAIR set)
   if ((!p || !priceUsd) && PAIR_ENV) {
     try {
       const { pair, source } = await dsPair(PAIR_ENV);
@@ -109,12 +115,10 @@ async function resolvePriceAndStats_FIXED() {
       }
       if (!priceUsd && Number(pair?.priceUsd) > 0) priceUsd = Number(pair.priceUsd);
       notes.push(`${source}: ok`);
-    } catch (e) {
-      notes.push(`ds-pair: ${e.message}`);
-    }
+    } catch (e) { notes.push(`ds-pair: ${e.message}`); }
   }
 
-  // C) PancakeSwap Info (price only)
+  // C) PancakeSwap
   if (!priceUsd) {
     try {
       const v = await psPriceUsd(CA);
@@ -123,7 +127,7 @@ async function resolvePriceAndStats_FIXED() {
     } catch (e) { notes.push(`pancakeswap: ${e.message}`); }
   }
 
-  // D) GeckoTerminal (price only)
+  // D) GeckoTerminal
   if (!priceUsd) {
     try {
       const v = await gtPriceUsd(CA);
@@ -135,10 +139,46 @@ async function resolvePriceAndStats_FIXED() {
   return { pair: p, dsSource, priceUsd, notes };
 }
 
-/* ----------------  /price reply  ---------------- */
-export async function replyPrice(ctx) {
+/* ========== COMMANDS ========== */
+bot.start((ctx) =>
+  ctx.reply("Hi! Use /ca, /price, /links")
+);
+
+bot.command(["ca"], async (ctx) => {
+  const bsc = `https://bscscan.com/token/${CA}`;
+  const pcs = `https://pancakeswap.finance/swap?outputCurrency=${CA}`;
+  const poo = `https://poocoin.app/tokens/${CA}`;
+  const dex = PAIR_ENV
+    ? `https://www.dextools.io/app/en/bnb/pair-explorer/${PAIR_ENV}`
+    : `https://www.dextools.io/app/en/bnb/search?q=${CA}`;
+  const msg = [
+    "<b>LABV2 Contract Address</b>",
+    `<code>${esc(CA)}</code>`,
+    "",
+    `📄 <a href="${bsc}">BscScan</a> | 🥞 <a href="${pcs}">PancakeSwap</a>`,
+    `💩 <a href="${poo}">PooCoin</a> | 📊 <a href="${dex}">DexTools</a>`,
+  ].join("\n");
+  await ctx.replyWithHTML(msg, { disable_web_page_preview: true });
+});
+
+bot.command(["links"], async (ctx) => {
+  // Replace with your real socials
+  const site = "https://your-website.example/";
+  const x    = "https://twitter.com/your_x_handle";
+  const tg   = "https://t.me/your_group";
+  const msg = [
+    "<b>LABV2 Official Links</b>",
+    `🌐 <a href="${site}">Website</a>`,
+    `𝕏 <a href="${x}">Twitter/X</a>`,
+    `🗣️ <a href="${tg}">Telegram</a>`,
+  ].join("\n");
+  await ctx.replyWithHTML(msg, { disable_web_page_preview: true });
+});
+
+bot.command(["price","prices"], async (ctx) => {
+  console.log("Received /price from", ctx.chat?.id); // visibility in logs
   try {
-    const { pair: p, priceUsd: usd, dsSource, notes } = await resolvePriceAndStats_FIXED();
+    const { pair: p, priceUsd: usd, dsSource, notes } = await resolvePriceAndStats();
 
     if (!usd) {
       const dbg = DEBUG ? `\n\n<code>${esc(notes.join(" | "))}</code>` : "";
@@ -185,5 +225,12 @@ export async function replyPrice(ctx) {
     const dbg = DEBUG ? `\n\n<code>${esc(String(err.message))}</code>` : "";
     await ctx.replyWithHTML(`❌ Unable to fetch price right now.${dbg}`);
   }
-}
-/* =====================  end /price handler  ===================== */
+});
+
+/* ========== START ========== */
+bot.launch();
+console.log("LABV2 bot is running…");
+
+/* graceful stop */
+process.once("SIGINT", () => bot.stop("SIGINT"));
+process.once("SIGTERM", () => bot.stop("SIGTERM"));
